@@ -158,7 +158,7 @@ def add_talmud_page(story, header, segments, commentaries, font_size):
         rightIndent=0,
         spaceAfter=4,
     )
-    story.append(Paragraph(hebrew_rtl(header), header_style))
+    story.append(Paragraph(header, header_style))  # Header is LTR, no hebrew_rtl processing
     for seg, comms in zip(segments, commentaries):
         story.append(Paragraph(hebrew_rtl(seg), text_style))
         for comm in comms:
@@ -224,7 +224,7 @@ def main(
                         comms.extend(comm_texts)
                     elif comm_err:
                         logger.debug(f"Missing commentary {prefix} on {ref}.{i}: {comm_err}")
-                        comms.append(f"[Missing commentary: {prefix} on {ref}.{i}]")
+                        # Don't add placeholder - just skip missing commentaries
                 all_commentaries.append(comms)
         # Pagination: group segments so all commentaries fit, or overflow to next page
         max_lines_per_page = 40  # rough estimate, can be parameterized
