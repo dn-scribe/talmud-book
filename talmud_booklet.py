@@ -9,6 +9,9 @@ from reportlab.platypus import Paragraph, Frame, SimpleDocTemplate, Spacer, Page
 from reportlab.lib.enums import TA_RIGHT
 import sys
 import os
+import json
+import logging
+import time
 
 # --- CONFIGURABLE ---
 DEFAULT_FONT = "NotoSansHebrew-Regular.ttf"  # You must have a Hebrew TTF font file in the same directory
@@ -16,9 +19,28 @@ DEFAULT_FONT_SIZE = 16
 DEFAULT_PAGE_SIZE = A4
 DEFAULT_OUTPUT = "output.pdf"
 DEFAULT_COMMENTARIES = ["Rashi_on_Berakhot"]
+CACHE_DIR = "data"
 # ---------------------
 
 def fetch_sefaria_text(ref):
+    # Create cache directory if it doesn't exist
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    
+    # Create a safe filename from the ref (replace / and . with _)
+    safe_filename = ref.replace("/", "_").replace(".", "_") + ".json"
+    cache_path = os.path.join(CACHE_DIR, safe_filename)
+    
+    # Check if cached file exists
+    if os.path.exists(cache_path):
+        logging.info(f"Loading {ref} from cache")
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data, None
+        except Exception as e:
+            logging.warning(f"Error reading cache for {ref}: {e}, fetching from API")
+    
+    # Fetch from API
     url = f"https://www.sefaria.org/api/v3/texts/{ref}"
     resp = requests.get(url)
     if resp.status_code != 200:
@@ -26,6 +48,15 @@ def fetch_sefaria_text(ref):
     data = resp.json()
     if "error" in data:
         return None, data["error"]
+    
+    # Save to cache
+    try:
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logging.info(f"Cached {ref} to {cache_path}")
+    except Exception as e:
+        logging.warning(f"Error caching {ref}: {e}")
+    
     return data, None
 
 def parse_range(ref_range):
@@ -144,6 +175,17 @@ def main(
     output_file=DEFAULT_OUTPUT,
     font_path=DEFAULT_FONT
 ):
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    logger = logging.getLogger(__name__)
+    
+    start_time = time.time()
+    logger.info("Starting Talmud booklet generation")
+    
     register_hebrew_font(font_path)
     story = []
 
@@ -151,14 +193,16 @@ def main(
     start_ref, end_ref = parse_range(ref_range)
     # Generate all refs in range
     refs = generate_talmud_refs(start_ref, end_ref)
+    logger.info(f"Processing {len(refs)} Talmud pages from {start_ref} to {end_ref}")
 
     if add_cover:
         add_cover_page(story, f"מסכת {start_ref}", font_size)
 
     for ref in refs:
+        logger.info(f"Fetching {ref}")
         data, err = fetch_sefaria_text(ref)
         if err:
-            print(f"Error fetching {ref}: {err}")
+            logger.warning(f"Error fetching {ref}: {err}")
             # Insert placeholder for missing page
             segments = [f"[Missing text for {ref}]"]
             all_commentaries = [[]]
@@ -179,7 +223,7 @@ def main(
                             comm_texts = [comm_texts]
                         comms.extend(comm_texts)
                     elif comm_err:
-                        print(f"  Missing commentary {prefix} on {ref}.{i}: {comm_err}")
+                        logger.debug(f"Missing commentary {prefix} on {ref}.{i}: {comm_err}")
                         comms.append(f"[Missing commentary: {prefix} on {ref}.{i}]")
                 all_commentaries.append(comms)
         # Pagination: group segments so all commentaries fit, or overflow to next page
@@ -218,11 +262,16 @@ def main(
         add_blank_page(story)
 
     # Output
+    logger.info(f"Writing output to {output_file}")
     if output_format == "pdf":
         doc = SimpleDocTemplate(output_file, pagesize=page_size, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
         doc.build(story)
+        logger.info(f"PDF generated successfully: {output_file}")
     else:
-        print("RTF output not implemented.")
+        logger.error("RTF output not implemented.")
+    
+    elapsed_time = time.time() - start_time
+    logger.info(f"Total execution time: {elapsed_time:.2f} seconds")
 
 if __name__ == "__main__":
     # Example usage: python talmud_booklet.py Berakhot_3b --font_size 18 --cover
