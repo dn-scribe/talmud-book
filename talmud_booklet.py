@@ -6,7 +6,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.platypus import Paragraph, Frame, SimpleDocTemplate, Spacer, PageBreak
-from reportlab.lib.enums import TA_RIGHT
+from reportlab.lib.enums import TA_RIGHT, TA_LEFT
 import sys
 import os
 import json
@@ -18,9 +18,36 @@ DEFAULT_FONT = "NotoSansHebrew-Regular.ttf"  # You must have a Hebrew TTF font f
 DEFAULT_FONT_SIZE = 16
 DEFAULT_PAGE_SIZE = A4
 DEFAULT_OUTPUT = "output.pdf"
-DEFAULT_COMMENTARIES = ["Rashi_on_Berakhot"]
+DEFAULT_COMMENTARIES = [] # ["Rashi_on_Berakhot:14:#0000FF", "Tosafot_on_Berakhot:14:#008000"]
 CACHE_DIR = "data"
 # ---------------------
+
+def parse_commentary_spec(spec):
+    """
+    Parse commentary specification in format: name[:font_size[:color]]
+    Examples:
+        "Rashi_on_Berakhot" -> ("Rashi_on_Berakhot", None, None)
+        "Rashi_on_Berakhot:10" -> ("Rashi_on_Berakhot", 10, None)
+        "Rashi_on_Berakhot:10:#0000FF" -> ("Rashi_on_Berakhot", 10, "#0000FF")
+        "Rashi_on_Berakhot::#FF0000" -> ("Rashi_on_Berakhot", None, "#FF0000")
+    """
+    parts = spec.split(':')
+    name = parts[0]
+    font_size = None
+    color = None
+    
+    if len(parts) > 1 and parts[1]:
+        try:
+            font_size = int(parts[1])
+        except ValueError:
+            logging.warning(f"Invalid font size in '{spec}', using default")
+    
+    if len(parts) > 2 and parts[2]:
+        color = parts[2]
+        if not color.startswith('#'):
+            color = '#' + color
+    
+    return name, font_size, color
 
 def fetch_sefaria_text(ref):
     # Create cache directory if it doesn't exist
@@ -41,7 +68,7 @@ def fetch_sefaria_text(ref):
             logging.warning(f"Error reading cache for {ref}: {e}, fetching from API")
     
     # Fetch from API
-    url = f"https://www.sefaria.org/api/v3/texts/{ref}"
+    url = f"https://www.sefaria.org/api/v3/texts/{ref}?return_format=text_only"
     resp = requests.get(url)
     if resp.status_code != 200:
         return None, f"HTTP {resp.status_code}"
@@ -130,16 +157,17 @@ def add_blank_page(story):
 def estimate_segment_height(segment, commentaries, font_size, chars_per_line=60, lines_per_page=40):
     # Rough estimate: 1 line per 60 chars, plus 1 line per commentary per 60 chars
     seg_lines = max(1, len(segment) // chars_per_line + 1)
-    comm_lines = sum(max(1, len(comm) // chars_per_line + 1) for comm in commentaries)
+    # commentaries is now a list of tuples (text, name)
+    comm_lines = sum(max(1, len(comm[0] if isinstance(comm, tuple) else comm) // chars_per_line + 1) for comm in commentaries)
     return seg_lines + comm_lines
 
-def add_talmud_page(story, header, segments, commentaries, font_size):
+def add_talmud_page(story, header, segments, commentaries, commentary_styles, font_size):
     # Header
     header_style = ParagraphStyle(
         name='Header',
         fontName='Hebrew',
         fontSize=font_size,
-        alignment=TA_RIGHT,
+        alignment=TA_LEFT,
         spaceAfter=10,
     )
     text_style = ParagraphStyle(
@@ -149,25 +177,35 @@ def add_talmud_page(story, header, segments, commentaries, font_size):
         alignment=TA_RIGHT,
         spaceAfter=6,
     )
-    comm_style = ParagraphStyle(
-        name='Commentary',
-        fontName='Hebrew',
-        fontSize=font_size - 2,
-        alignment=TA_RIGHT,
-        leftIndent=20,
-        rightIndent=0,
-        spaceAfter=4,
-    )
+    
     story.append(Paragraph(header, header_style))  # Header is LTR, no hebrew_rtl processing
     for seg, comms in zip(segments, commentaries):
         story.append(Paragraph(hebrew_rtl(seg), text_style))
-        for comm in comms:
-            story.append(Paragraph(hebrew_rtl(comm), comm_style))
+        for comm_data in comms:
+            # comm_data is a tuple: (text, commentary_name)
+            comm_text, comm_name = comm_data
+            # Get style for this commentary
+            style_info = commentary_styles.get(comm_name, {})
+            comm_font_size = style_info.get('font_size', font_size - 2)
+            comm_color = style_info.get('color', '#000000')
+            
+            # Create paragraph style for this commentary
+            comm_style = ParagraphStyle(
+                name=f'Commentary_{comm_name}',
+                fontName='Hebrew',
+                fontSize=comm_font_size,
+                alignment=TA_RIGHT,
+                leftIndent=20,
+                rightIndent=0,
+                spaceAfter=4,
+                textColor=comm_color,
+            )
+            story.append(Paragraph(hebrew_rtl(comm_text), comm_style))
     story.append(PageBreak())
 
 def main(
     ref_range,
-    commentary_prefixes=DEFAULT_COMMENTARIES,
+    commentary_specs=DEFAULT_COMMENTARIES,
     font_size=DEFAULT_FONT_SIZE,
     page_size=DEFAULT_PAGE_SIZE,
     add_cover=False,
@@ -188,6 +226,19 @@ def main(
     
     register_hebrew_font(font_path)
     story = []
+
+    # Parse commentary specifications
+    commentary_styles = {}
+    commentary_prefixes = []
+    for spec in commentary_specs:
+        name, comm_font_size, color = parse_commentary_spec(spec)
+        commentary_prefixes.append(name)
+        commentary_styles[name] = {
+            'font_size': comm_font_size if comm_font_size else font_size - 2,
+            'color': color if color else '#000000'
+        }
+    
+    logger.info(f"Commentaries: {', '.join(commentary_prefixes)}")
 
     # Parse range
     start_ref, end_ref = parse_range(ref_range)
@@ -221,7 +272,9 @@ def main(
                         comm_texts = comm_data["versions"][0]["text"]
                         if isinstance(comm_texts, str):
                             comm_texts = [comm_texts]
-                        comms.extend(comm_texts)
+                        # Store as tuples: (text, commentary_name)
+                        for text in comm_texts:
+                            comms.append((text, prefix))
                     elif comm_err:
                         logger.debug(f"Missing commentary {prefix} on {ref}.{i}: {comm_err}")
                         # Don't add placeholder - just skip missing commentaries
@@ -252,7 +305,7 @@ def main(
             # Header: text name, page, segment range
             seg_range = f"{start_idx+1}-{start_idx+len(page_segments)}" if len(page_segments) > 1 else f"{start_idx+1}"
             header = f"{data['title']} {ref.split('_')[1]} (Segments {seg_range})"
-            add_talmud_page(story, header, page_segments, page_commentaries, font_size)
+            add_talmud_page(story, header, page_segments, page_commentaries, commentary_styles, font_size)
             # Ensure new Talmud text starts on even page
             if idx < len(segments) and len(story) % 2 != 0:
                 add_blank_page(story)
@@ -274,21 +327,42 @@ def main(
     logger.info(f"Total execution time: {elapsed_time:.2f} seconds")
 
 if __name__ == "__main__":
-    # Example usage: python talmud_booklet.py Berakhot_3b --font_size 18 --cover
+    # Example usage: 
+    # python talmud_booklet.py Berakhot_3b --font_size 18 --cover
+    # python talmud_booklet.py Berakhot_3a --commentaries Rashi_on_Berakhot:10:#0000FF Tosafot_on_Berakhot:12:#008000
     import argparse
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Generate Talmud booklet PDFs with optional commentaries",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commentary Format:
+  Commentaries can be specified with optional font size and color:
+    name[:font_size[:color]]
+  
+  Examples:
+    Rashi_on_Berakhot                    # Default size and black color
+    Rashi_on_Berakhot:10                 # Font size 10, black color
+    Rashi_on_Berakhot:10:#0000FF         # Font size 10, blue color
+    Rashi_on_Berakhot::#FF0000           # Default size, red color
+    
+  Multiple commentaries:
+    --commentaries Rashi_on_Berakhot:10:#0000FF Tosafot_on_Berakhot:12:#008000
+        """
+    )
     parser.add_argument("ref_range", help="Reference or range, e.g. Berakhot_3a-Berakhot_5b")
-    parser.add_argument("--commentaries", nargs="+", default=DEFAULT_COMMENTARIES)
-    parser.add_argument("--font_size", type=int, default=DEFAULT_FONT_SIZE)
-    parser.add_argument("--page_size", default="A4")
-    parser.add_argument("--cover", action="store_true")
-    parser.add_argument("--format", default="pdf")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT)
-    parser.add_argument("--font", default=DEFAULT_FONT)
+    parser.add_argument("--commentaries", nargs="+", default=DEFAULT_COMMENTARIES,
+                        help="Commentary specifications (see format below)")
+    parser.add_argument("--font_size", type=int, default=DEFAULT_FONT_SIZE,
+                        help="Base font size for main text")
+    parser.add_argument("--page_size", default="A4", help="Page size (A4 or custom)")
+    parser.add_argument("--cover", action="store_true", help="Add cover page")
+    parser.add_argument("--format", default="pdf", help="Output format (pdf only)")
+    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output file path")
+    parser.add_argument("--font", default=DEFAULT_FONT, help="Path to Hebrew TTF font file")
     args = parser.parse_args()
     main(
         args.ref_range,
-        commentary_prefixes=args.commentaries,
+        commentary_specs=args.commentaries,
         font_size=args.font_size,
         page_size=A4 if args.page_size == "A4" else args.page_size,
         add_cover=args.cover,
