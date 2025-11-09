@@ -124,8 +124,8 @@ def hebrew_rtl(text):
     # No need for RTL processing with HTML/CSS - the browser handles it
     return text
 
-def generate_html(pages, title, font_path, font_size, commentary_styles):
-    """Generate HTML for the entire document."""
+def generate_html(all_content, title, font_path, font_size, commentary_styles):
+    """Generate HTML for the entire document with CSS paged media for proper pagination."""
     font_path_resolved = Path(font_path).resolve()
     
     # Build CSS for commentary styles
@@ -151,6 +151,22 @@ def generate_html(pages, title, font_path, font_size, commentary_styles):
     src: url('file://{font_path_resolved}');
   }}
   
+  @page {{
+    margin: 15mm 10mm;
+    @top-center {{
+      content: "- " counter(page) " -";
+      font-family: 'HebrewFont', 'Noto Sans Hebrew', sans-serif;
+      font-size: {font_size - 2}pt;
+      direction: ltr;
+    }}
+  }}
+  
+  @page :first {{
+    @top-center {{
+      content: none;
+    }}
+  }}
+  
   body {{
     font-family: 'HebrewFont', 'Noto Sans Hebrew', sans-serif;
     direction: rtl;
@@ -161,29 +177,36 @@ def generate_html(pages, title, font_path, font_size, commentary_styles):
     padding: 0;
   }}
   
-  .page {{
-    page-break-after: always;
-    padding: 8mm 6mm;
-  }}
-  
   .cover {{
     display: flex;
     align-items: center;
     justify-content: center;
     font-size: {font_size + 4}pt;
     min-height: 100vh;
+    page-break-after: always;
   }}
   
-  .header {{
+  .talmud-page {{
+    page-break-before: avoid;
+    margin-bottom: 8mm;
+  }}
+  
+  .page-header {{
     direction: ltr;
     text-align: left;
     margin-bottom: 6px;
     font-size: {font_size - 1}pt;
     font-weight: bold;
+    page-break-after: avoid;
+  }}
+  
+  .segment-block {{
+    page-break-inside: avoid;
+    margin-bottom: 6px;
   }}
   
   .segment {{
-    margin-bottom: 4px;
+    margin-bottom: 3px;
     text-align: right;
   }}
   
@@ -193,40 +216,40 @@ def generate_html(pages, title, font_path, font_size, commentary_styles):
   
 {commentary_css}
 </style>
+<body>
 """
     
-    for page in pages:
-        if page['type'] == 'cover':
-            html += f"""
-<div class="page cover">
-  <h1 dir="rtl">{page['title']}</h1>
+    # Add cover if present
+    if all_content.get('cover'):
+        html += f"""
+<div class="cover">
+  <h1 dir="rtl">{all_content['cover']}</h1>
 </div>
 """
-        elif page['type'] == 'content':
-            html += '<div class="page">\n'
-            html += f'  <div class="header">{page["header"]}</div>\n'
-            for seg_data in page['segments']:
-                html += f'  <div class="segment">{seg_data["text"]}</div>\n'
-                for comm in seg_data['commentaries']:
-                    safe_name = comm['name'].replace("_", "-")
-                    html += f'  <div class="commentary commentary-{safe_name}">{comm["text"]}</div>\n'
-            html += '</div>\n'
+    
+    # Add all Talmud pages
+    for talmud_page in all_content['pages']:
+        html += '<div class="talmud-page">\n'
+        html += f'  <div class="page-header">{talmud_page["header"]}</div>\n'
+        
+        for seg_data in talmud_page['segments']:
+            html += '  <div class="segment-block">\n'
+            html += f'    <div class="segment">{seg_data["text"]}</div>\n'
+            for comm in seg_data['commentaries']:
+                safe_name = comm['name'].replace("_", "-")
+                html += f'    <div class="commentary commentary-{safe_name}">{comm["text"]}</div>\n'
+            html += '  </div>\n'
+        
+        html += '</div>\n'
     
     html += "</body>\n</html>"
     return html
 
-def add_cover_page(pages, title):
-    pages.append({'type': 'cover', 'title': title})
+def add_cover_page(content, title):
+    content['cover'] = title
 
-def estimate_segment_height(segment, commentaries, font_size, chars_per_line=60, lines_per_page=40):
-    # Rough estimate: 1 line per 60 chars, plus 1 line per commentary per 60 chars
-    seg_lines = max(1, len(segment) // chars_per_line + 1)
-    # commentaries is now a list of tuples (text, name)
-    comm_lines = sum(max(1, len(comm[0] if isinstance(comm, tuple) else comm) // chars_per_line + 1) for comm in commentaries)
-    return seg_lines + comm_lines
-
-def add_talmud_page(pages, header, segments, commentaries, commentary_styles, font_size):
-    """Add a talmud page with segments and commentaries."""
+def build_talmud_page(header, segments, commentaries):
+    """Build a talmud page structure with segments and commentaries."""
     segment_data = []
     for seg, comms in zip(segments, commentaries):
         comm_list = []
@@ -234,11 +257,10 @@ def add_talmud_page(pages, header, segments, commentaries, commentary_styles, fo
             comm_list.append({'text': comm_text, 'name': comm_name})
         segment_data.append({'text': seg, 'commentaries': comm_list})
     
-    pages.append({
-        'type': 'content',
+    return {
         'header': header,
         'segments': segment_data
-    })
+    }
 
 def main(
     ref_range,
@@ -261,7 +283,11 @@ def main(
     start_time = time.time()
     logger.info("Starting Talmud booklet generation")
     
-    pages = []
+    # Initialize content structure
+    all_content = {
+        'cover': None,
+        'pages': []
+    }
 
     # Parse commentary specifications
     commentary_styles = {}
@@ -283,7 +309,7 @@ def main(
     logger.info(f"Processing {len(refs)} Talmud pages from {start_ref} to {end_ref}")
 
     if add_cover:
-        add_cover_page(pages, f"מסכת {start_ref}")
+        add_cover_page(all_content, f"מסכת {start_ref}")
 
     for ref in refs:
         logger.info(f"Fetching {ref}")
@@ -315,37 +341,17 @@ def main(
                         logger.debug(f"Missing commentary {prefix} on {ref}.{i}: {comm_err}")
                         # Don't add placeholder - just skip missing commentaries
                 all_commentaries.append(comms)
-        # Pagination: group segments so all commentaries fit, or overflow to next page
-        max_lines_per_page = 40  # rough estimate, can be parameterized
-        idx = 0
-        while idx < len(segments):
-            page_segments = []
-            page_commentaries = []
-            used_lines = 3  # header
-            start_idx = idx
-            while idx < len(segments):
-                seg = segments[idx]
-                comms = all_commentaries[idx]
-                seg_height = estimate_segment_height(seg, comms, font_size)
-                if used_lines + seg_height > max_lines_per_page:
-                    if not page_segments:
-                        # Single segment too big, force it to overflow
-                        page_segments.append(seg)
-                        page_commentaries.append(comms)
-                        idx += 1
-                    break
-                page_segments.append(seg)
-                page_commentaries.append(comms)
-                used_lines += seg_height
-                idx += 1
-            # Header: text name, page, segment range
-            seg_range = f"{start_idx+1}-{start_idx+len(page_segments)}" if len(page_segments) > 1 else f"{start_idx+1}"
-            header = f"{data['title']} {ref.split('_')[1]} (Segments {seg_range})"
-            add_talmud_page(pages, header, page_segments, page_commentaries, commentary_styles, font_size)
+        
+        # Create header for this Talmud page (all segments from this daf)
+        header = f"{data.get('title', ref)} {ref.split('_')[1]}"
+        
+        # Build the page with all its segments
+        talmud_page = build_talmud_page(header, segments, all_commentaries)
+        all_content['pages'].append(talmud_page)
 
     # Generate HTML
     logger.info("Generating HTML")
-    html_content = generate_html(pages, start_ref, font_path, font_size, commentary_styles)
+    html_content = generate_html(all_content, start_ref, font_path, font_size, commentary_styles)
     
     # Write HTML to temporary file
     html_file = Path("temp_talmud.html")
@@ -362,7 +368,7 @@ def main(
             path=output_file,
             format=page_format,
             print_background=True,
-            margin={"top": "5mm", "bottom": "5mm", "left": "5mm", "right": "5mm"}
+            margin={"top": "0mm", "bottom": "0mm", "left": "0mm", "right": "0mm"}
         )
         browser.close()
     
