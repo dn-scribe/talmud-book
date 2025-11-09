@@ -124,8 +124,250 @@ def hebrew_rtl(text):
     # No need for RTL processing with HTML/CSS - the browser handles it
     return text
 
-def generate_html(all_content, title, font_path, font_size, commentary_styles):
-    """Generate HTML for the entire document with CSS paged media for proper pagination."""
+def estimate_segment_size(seg_data, commentary_styles):
+    """Estimate the relative size of a segment with its commentaries.
+    Returns a rough score to help batch segments optimally."""
+    # Base score for the segment text
+    score = len(seg_data['text']) / 100  # ~1 point per 100 chars
+    
+    # Add score for commentaries
+    for comm in seg_data['commentaries']:
+        comm_font_size = commentary_styles.get(comm['name'], {}).get('font_size', 8)
+        # Smaller font = less space, adjust score accordingly
+        size_factor = comm_font_size / 10.0
+        score += (len(comm['text']) / 100) * size_factor
+    
+    return score
+
+def create_dynamic_batches(segments, commentary_styles, target_batch_size=10):
+    """Dynamically group segments into batches based on estimated size.
+    Aims for batches that will fit on one page (target_batch_size is in points)."""
+    batches = []
+    current_batch = []
+    current_size = 0
+    
+    for seg_data in segments:
+        seg_size = estimate_segment_size(seg_data, commentary_styles)
+        
+        # If adding this segment would exceed target, start new batch
+        if current_batch and current_size + seg_size > target_batch_size:
+            batches.append(current_batch)
+            current_batch = [seg_data]
+            current_size = seg_size
+        else:
+            current_batch.append(seg_data)
+            current_size += seg_size
+    
+    # Add final batch
+    if current_batch:
+        batches.append(current_batch)
+    
+    return batches
+
+def generate_html_optimized(all_content, title, font_path, font_size, commentary_styles, commentary_order):
+    """Generate HTML with optimized layout: batches segments with all Talmud first, then commentaries.
+    
+    DYNAMIC BATCHING: Estimates content size and groups 2-4 segments per batch.
+    For each batch:
+      1. Print all Talmud segments
+      2. Print all Rashi commentaries for those segments
+      3. Print all Tosafot commentaries for those segments
+    
+    Args:
+        commentary_order: List of commentary names in the order they should appear
+    """
+    font_path_resolved = Path(font_path).resolve()
+    
+    # Build CSS for commentary styles
+    commentary_css = ""
+    for name, style_info in commentary_styles.items():
+        safe_name = name.replace("_", "-")
+        commentary_css += f"""
+  .commentary-{safe_name} {{
+    font-size: {style_info['font_size']}pt;
+    color: {style_info['color']};
+    margin-right: 10px;
+    margin-top: 2px;
+    margin-bottom: 2px;
+  }}
+"""
+    
+    html = f"""
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  @font-face {{
+    font-family: 'HebrewFont';
+    src: url('file://{font_path_resolved}');
+  }}
+  
+  @page {{
+    margin: 15mm 10mm;
+    @top-center {{
+      content: "- " counter(page) " -";
+      font-family: 'HebrewFont', 'Noto Sans Hebrew', sans-serif;
+      font-size: {font_size - 2}pt;
+      direction: ltr;
+    }}
+  }}
+  
+  @page :first {{
+    @top-center {{
+      content: none;
+    }}
+  }}
+  
+  body {{
+    font-family: 'HebrewFont', 'Noto Sans Hebrew', sans-serif;
+    direction: rtl;
+    unicode-bidi: plaintext;
+    font-size: {font_size}pt;
+    line-height: 1.4;
+    margin: 0;
+    padding: 0;
+  }}
+  
+  .cover {{
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: {font_size + 4}pt;
+    min-height: 100vh;
+    page-break-after: always;
+  }}
+  
+  .page-header {{
+    direction: ltr;
+    text-align: left;
+    margin-bottom: 6px;
+    font-size: {font_size - 1}pt;
+    font-weight: bold;
+    page-break-after: avoid;
+  }}
+  
+  /* Content block keeps segment groups with their commentaries together */
+  .content-block {{
+    page-break-inside: avoid;
+    margin-bottom: 8px;
+  }}
+  
+  /* Talmud section for grouped text entries */
+  .talmud-section {{
+    margin-bottom: 6px;
+  }}
+  
+  .segment {{
+    margin-bottom: 3px;
+    text-align: justify;
+    text-align-last: right;
+  }}
+  
+  /* Commentary section organized by commentary type */
+  .commentary-section {{
+    margin-top: 4px;
+    padding-top: 4px;
+    border-top: 1px solid #ddd;
+  }}
+  
+  .commentary-type-group {{
+    margin-bottom: 5px;
+  }}
+  
+  .commentary-type-header {{
+    font-size: {font_size - 1}pt;
+    font-weight: bold;
+    margin-bottom: 3px;
+    margin-top: 3px;
+  }}
+  
+  .commentary-item {{
+    margin-bottom: 2px;
+  }}
+  
+  .commentary {{
+    text-align: justify;
+    text-align-last: right;
+  }}
+  
+{commentary_css}
+</style>
+<body>
+"""
+    
+    # Add cover if present
+    if all_content.get('cover'):
+        html += f"""
+<div class="cover">
+  <h1 dir="rtl">{all_content['cover']}</h1>
+</div>
+"""
+    
+    # Add all Talmud pages with DYNAMIC BATCHING
+    for talmud_page in all_content['pages']:
+        html += f'<div class="page-header">{talmud_page["header"]}</div>\n'
+        
+        segments = talmud_page['segments']
+        
+        # Dynamically create batches based on estimated content size
+        batches = create_dynamic_batches(segments, commentary_styles, target_batch_size=10)
+        
+        segment_counter = 1
+        for batch in batches:
+            html += '<div class="content-block">\n'
+            
+            # Step 1: Print ALL Talmud text segments in this batch
+            html += '  <div class="talmud-section">\n'
+            batch_start_num = segment_counter
+            for seg_data in batch:
+                html += f'    <div class="segment"><b>[{segment_counter}]</b> {seg_data["text"]}</div>\n'
+                segment_counter += 1
+            html += '  </div>\n'
+            
+            # Step 2: Group commentaries by type and print all of each type
+            commentary_types = {}  # {name: [(segment_num, text), ...]}
+            seg_num = batch_start_num
+            for seg_data in batch:
+                for comm in seg_data['commentaries']:
+                    comm_name = comm['name']
+                    if comm_name not in commentary_types:
+                        commentary_types[comm_name] = []
+                    commentary_types[comm_name].append((seg_num, comm['text']))
+                seg_num += 1
+            
+            # Print commentaries grouped by type
+            if commentary_types:
+                html += '  <div class="commentary-section">\n'
+                
+                # Iterate in the order specified by commentary_order
+                for comm_name in commentary_order:
+                    if comm_name not in commentary_types:
+                        continue
+                    
+                    comm_items = commentary_types[comm_name]
+                    safe_name = comm_name.replace("_", "-")
+                    display_name = comm_name.replace('_on_Berakhot', '').replace('_', ' ')
+                    
+                    html += f'    <div class="commentary-type-group commentary-{safe_name}">\n'
+                    html += f'      <div class="commentary-type-header">{display_name}:</div>\n'
+                    
+                    for seg_num, comm_text in comm_items:
+                        html += f'      <div class="commentary-item"><b>[{seg_num}]</b> {comm_text}</div>\n'
+                    
+                    html += '    </div>\n'
+                
+                html += '  </div>\n'
+            
+            html += '</div>\n'  # end content-block
+    
+    html += "</body>\n</html>"
+    return html
+
+def generate_html_text_commentaries(all_content, title, font_path, font_size, commentary_styles, commentary_order):
+    """Generate HTML with traditional layout: text followed immediately by its commentaries.
+    
+    TRADITIONAL LAYOUT: Each segment is followed by its commentaries inline.
+    This is the original format from the committed code.
+    """
     font_path_resolved = Path(font_path).resolve()
     
     # Build CSS for commentary styles
@@ -229,7 +471,7 @@ def generate_html(all_content, title, font_path, font_size, commentary_styles):
 </div>
 """
     
-    # Add all Talmud pages
+    # Add all Talmud pages with traditional layout
     for talmud_page in all_content['pages']:
         html += '<div class="talmud-page">\n'
         html += f'  <div class="page-header">{talmud_page["header"]}</div>\n'
@@ -246,6 +488,13 @@ def generate_html(all_content, title, font_path, font_size, commentary_styles):
     
     html += "</body>\n</html>"
     return html
+
+def generate_html(all_content, title, font_path, font_size, commentary_styles, commentary_order, text_format='optimize'):
+    """Dispatcher function to select the appropriate HTML generation method."""
+    if text_format == 'text-commentaries':
+        return generate_html_text_commentaries(all_content, title, font_path, font_size, commentary_styles, commentary_order)
+    else:  # 'optimize' is default
+        return generate_html_optimized(all_content, title, font_path, font_size, commentary_styles, commentary_order)
 
 def add_cover_page(content, title):
     content['cover'] = title
@@ -272,7 +521,8 @@ def main(
     output_format="pdf",
     output_file=DEFAULT_OUTPUT,
     font_path=DEFAULT_FONT,
-    page_format=DEFAULT_PAGE_FORMAT
+    page_format=DEFAULT_PAGE_FORMAT,
+    text_format="optimize"
 ):
     # Setup logging
     logging.basicConfig(
@@ -353,7 +603,7 @@ def main(
 
     # Generate HTML
     logger.info("Generating HTML")
-    html_content = generate_html(all_content, start_ref, font_path, font_size, commentary_styles)
+    html_content = generate_html(all_content, start_ref, font_path, font_size, commentary_styles, commentary_prefixes, text_format)
     
     # Write HTML to temporary file
     html_file = Path("temp_talmud.html")
@@ -411,6 +661,8 @@ Commentary Format:
                         help="Base font size for main text")
     parser.add_argument("--page_format", default=DEFAULT_PAGE_FORMAT, 
                         help="Page format (A4, A5, A6, Letter, etc.)")
+    parser.add_argument("--text_format", default="optimize", choices=["optimize", "text-commentaries"],
+                        help="Layout format: 'optimize' (batched, default) or 'text-commentaries' (traditional inline)")
     parser.add_argument("--cover", action="store_true", help="Add cover page")
     parser.add_argument("--format", default="pdf", help="Output format (pdf only)")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output file path")
@@ -424,5 +676,6 @@ Commentary Format:
         output_format=args.format,
         output_file=args.output,
         font_path=args.font,
-        page_format=args.page_format
+        page_format=args.page_format,
+        text_format=args.text_format
     )
