@@ -50,7 +50,8 @@ python talmud_booklet.py Berakhot_2a \
 - `--text_format` - Layout format: `optimize` (batched, default) or `text-commentaries` (traditional inline)
 - `--cover` - Add a cover page
 - `--no-cache` - Ignore content cache and regenerate from API (deletes existing cache)
-- `--output` - Output PDF filename (default: output.pdf)
+- `--format` - Output format: `pdf` (default), `html`, or `html-for-epub`
+- `--output` - Output filename (default: output.pdf)
 - `--font` - Path to Hebrew TTF font file (default: NotoSansHebrew-Regular.ttf)
 
 ### Examples
@@ -69,6 +70,23 @@ python talmud_booklet.py Berakhot_2a \
   --page_format A4 \
   --font_size 14 \
   --commentaries Rashi_on_Berakhot:12:#0000FF
+```
+
+Export as HTML for web viewing:
+```bash
+python talmud_booklet.py Berakhot_2a \
+  --format html \
+  --output berakhot_2a.html
+```
+
+Export as HTML for EPUB conversion:
+```bash
+python talmud_booklet.py Berakhot_2a \
+  --format html-for-epub \
+  --output berakhot_2a.html
+
+# Then convert to EPUB using pandoc or Calibre:
+pandoc berakhot_2a.html -o berakhot_2a.epub
 ```
 
 ## Installation
@@ -112,6 +130,27 @@ python talmud_booklet.py Berakhot_2a
 This should generate `output.pdf` with the first page of Tractate Berakhot.
 
 ## Technical Details
+
+### Output Formats
+
+The generator supports three output formats:
+
+1. **PDF (default)**: High-quality print-ready PDFs using Playwright/Chromium
+   - Best for printing physical booklets
+   - Preserves exact layout and pagination
+   - Requires Playwright browser installation
+
+2. **HTML**: Standalone HTML files with embedded CSS
+   - View in any web browser
+   - Easy to share and archive
+   - No external dependencies needed for viewing
+   - Suitable for online study or screen reading
+
+3. **HTML-for-EPUB**: HTML optimized for EPUB conversion
+   - The script generates HTML that can be converted to EPUB
+   - Use tools like [pandoc](https://pandoc.org/) or [Calibre](https://calibre-ebook.com/)
+   - Best for e-readers and mobile devices
+   - Example conversion: `pandoc output.html -o output.epub`
 
 ### Rendering Process
 

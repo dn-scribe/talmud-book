@@ -11,7 +11,7 @@ import time
 DEFAULT_FONT = "NotoSansHebrew-Regular.ttf"  # You must have a Hebrew TTF font file in the same directory
 DEFAULT_FONT_SIZE = 10  # Smaller for A6
 DEFAULT_OUTPUT = "output.pdf"
-DEFAULT_COMMENTARIES = ["Rashi_on_Berakhot:8:#0000FF", "Tosafot_on_Berakhot:8:#008000"]
+DEFAULT_COMMENTARIES = [] #["Rashi_on_Berakhot:8:#0000FF", "Tosafot_on_Berakhot:8:#008000"]
 CACHE_DIR = "data"
 CONTENT_CACHE_DIR = "content_cache"  # Directory for all_content cache files
 DEFAULT_PAGE_FORMAT = "A6"  # A6 is half the size of A5, which is half of A4
@@ -602,7 +602,7 @@ def main(
     logger = logging.getLogger(__name__)
     
     start_time = time.time()
-    logger.info("Starting Talmud booklet generation")
+    logger.info(f"Starting Talmud booklet generation (format: {output_format})")
     
     # Generate cache filename based on options
     cache_filename = generate_content_cache_filename(ref_range, commentary_specs, add_cover)
@@ -706,29 +706,50 @@ def main(
     logger.info("Generating HTML")
     html_content = generate_html(all_content, ref_range, font_path, font_size, commentary_styles, commentary_prefixes, text_format)
     
-    # Write HTML to temporary file
-    html_file = Path("temp_talmud.html")
-    html_file.write_text(html_content, encoding="utf-8")
-    logger.info(f"HTML written to {html_file}")
+    if output_format == "html":
+        # Export as HTML
+        output_path = Path(output_file)
+        output_path.write_text(html_content, encoding="utf-8")
+        logger.info(f"HTML file generated successfully: {output_file}")
+    
+    elif output_format == "html-for-epub":
+        # Export as HTML for EPUB conversion
+        logger.info(f"Generating HTML for EPUB conversion: {output_file}")
+        
+        # Note: Full EPUB support would require additional libraries like ebooklib
+        logger.info("HTML file will be saved for EPUB conversion.")
+        logger.info("Use a tool like Calibre or pandoc to convert HTML to EPUB:")
+        logger.info(f"  pandoc {output_file} -o {output_file.replace('.html', '.epub')}")
+        
+        output_path = Path(output_file)
+        output_path.write_text(html_content, encoding="utf-8")
+        logger.info(f"HTML file generated for EPUB conversion: {output_path}")
+    
+    else:  # pdf (default)
+        # Write HTML to temporary file
+        html_file = Path("temp_talmud.html")
+        html_file.write_text(html_content, encoding="utf-8")
+        logger.info(f"HTML written to {html_file}")
 
-    # Generate PDF using Playwright
-    logger.info(f"Generating PDF with Playwright: {output_file}")
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
-        page.goto(html_file.resolve().as_uri())
-        page.pdf(
-            path=output_file,
-            format=page_format,
-            print_background=True,
-            margin={"top": "0mm", "bottom": "0mm", "left": "0mm", "right": "0mm"}
-        )
-        browser.close()
+        # Generate PDF using Playwright
+        logger.info(f"Generating PDF with Playwright: {output_file}")
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto(html_file.resolve().as_uri())
+            page.pdf(
+                path=output_file,
+                format=page_format,
+                print_background=True,
+                margin={"top": "0mm", "bottom": "0mm", "left": "0mm", "right": "0mm"}
+            )
+            browser.close()
+        
+        # Clean up temporary HTML file
+        html_file.unlink()
+        
+        logger.info(f"PDF generated successfully: {output_file}")
     
-    # Clean up temporary HTML file
-    html_file.unlink()
-    
-    logger.info(f"PDF generated successfully: {output_file}")
     elapsed_time = time.time() - start_time
     logger.info(f"Total execution time: {elapsed_time:.2f} seconds")
 
@@ -767,7 +788,8 @@ Commentary Format:
     parser.add_argument("--cover", action="store_true", help="Add cover page")
     parser.add_argument("--no-cache", action="store_true", 
                         help="Ignore content cache and regenerate from API (deletes existing cache)")
-    parser.add_argument("--format", default="pdf", help="Output format (pdf only)")
+    parser.add_argument("--format", default="pdf", choices=["pdf", "html", "html-for-epub"],
+                        help="Output format: pdf (default), html, or html-for-epub")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output file path")
     parser.add_argument("--font", default=DEFAULT_FONT, help="Path to Hebrew TTF font file")
     args = parser.parse_args()
