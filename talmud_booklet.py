@@ -1,12 +1,6 @@
 import requests
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.platypus import Paragraph, Frame, SimpleDocTemplate, Spacer, PageBreak
-from reportlab.lib.enums import TA_RIGHT, TA_LEFT
+from playwright.sync_api import sync_playwright
+from pathlib import Path
 import sys
 import os
 import json
@@ -15,11 +9,11 @@ import time
 
 # --- CONFIGURABLE ---
 DEFAULT_FONT = "NotoSansHebrew-Regular.ttf"  # You must have a Hebrew TTF font file in the same directory
-DEFAULT_FONT_SIZE = 16
-DEFAULT_PAGE_SIZE = A4
+DEFAULT_FONT_SIZE = 10  # Smaller for A6
 DEFAULT_OUTPUT = "output.pdf"
-DEFAULT_COMMENTARIES = [] # ["Rashi_on_Berakhot:14:#0000FF", "Tosafot_on_Berakhot:14:#008000"]
+DEFAULT_COMMENTARIES = ["Rashi_on_Berakhot:8:#0000FF", "Tosafot_on_Berakhot:8:#008000"]
 CACHE_DIR = "data"
+DEFAULT_PAGE_FORMAT = "A6"  # A6 is half the size of A5, which is half of A4
 # ---------------------
 
 def parse_commentary_spec(spec):
@@ -127,32 +121,102 @@ def generate_talmud_refs(start_ref, end_ref):
     return refs
 
 def hebrew_rtl(text):
-    # Improved RTL: try to use python-bidi if available, else fallback to reverse
-    try:
-        from bidi.algorithm import get_display
-        return get_display(text)
-    except ImportError:
-        return text[::-1]
+    # No need for RTL processing with HTML/CSS - the browser handles it
+    return text
 
-def register_hebrew_font(font_path):
-    pdfmetrics.registerFont(TTFont("Hebrew", font_path))
+def generate_html(pages, title, font_path, font_size, commentary_styles):
+    """Generate HTML for the entire document."""
+    font_path_resolved = Path(font_path).resolve()
+    
+    # Build CSS for commentary styles
+    commentary_css = ""
+    for name, style_info in commentary_styles.items():
+        safe_name = name.replace("_", "-")
+        commentary_css += f"""
+  .commentary-{safe_name} {{
+    font-size: {style_info['font_size']}pt;
+    color: {style_info['color']};
+    margin-right: 10px;
+    margin-top: 2px;
+    margin-bottom: 2px;
+  }}
+"""
+    
+    html = f"""
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  @font-face {{
+    font-family: 'HebrewFont';
+    src: url('file://{font_path_resolved}');
+  }}
+  
+  body {{
+    font-family: 'HebrewFont', 'Noto Sans Hebrew', sans-serif;
+    direction: rtl;
+    unicode-bidi: plaintext;
+    font-size: {font_size}pt;
+    line-height: 1.4;
+    margin: 0;
+    padding: 0;
+  }}
+  
+  .page {{
+    page-break-after: always;
+    padding: 8mm 6mm;
+  }}
+  
+  .cover {{
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: {font_size + 4}pt;
+    min-height: 100vh;
+  }}
+  
+  .header {{
+    direction: ltr;
+    text-align: left;
+    margin-bottom: 6px;
+    font-size: {font_size - 1}pt;
+    font-weight: bold;
+  }}
+  
+  .segment {{
+    margin-bottom: 4px;
+    text-align: right;
+  }}
+  
+  .commentary {{
+    text-align: right;
+  }}
+  
+{commentary_css}
+</style>
+"""
+    
+    for page in pages:
+        if page['type'] == 'cover':
+            html += f"""
+<div class="page cover">
+  <h1 dir="rtl">{page['title']}</h1>
+</div>
+"""
+        elif page['type'] == 'content':
+            html += '<div class="page">\n'
+            html += f'  <div class="header">{page["header"]}</div>\n'
+            for seg_data in page['segments']:
+                html += f'  <div class="segment">{seg_data["text"]}</div>\n'
+                for comm in seg_data['commentaries']:
+                    safe_name = comm['name'].replace("_", "-")
+                    html += f'  <div class="commentary commentary-{safe_name}">{comm["text"]}</div>\n'
+            html += '</div>\n'
+    
+    html += "</body>\n</html>"
+    return html
 
-def add_cover_page(story, title, font_size):
-    style = ParagraphStyle(
-        name='Cover',
-        fontName='Hebrew',
-        fontSize=font_size + 10,
-        alignment=TA_RIGHT,
-        rightIndent=0,
-        leftIndent=0,
-        spaceAfter=20,
-    )
-    story.append(Spacer(1, 100))
-    story.append(Paragraph(hebrew_rtl(title), style))
-    story.append(PageBreak())
-
-def add_blank_page(story):
-    story.append(PageBreak())
+def add_cover_page(pages, title):
+    pages.append({'type': 'cover', 'title': title})
 
 def estimate_segment_height(segment, commentaries, font_size, chars_per_line=60, lines_per_page=40):
     # Rough estimate: 1 line per 60 chars, plus 1 line per commentary per 60 chars
@@ -161,57 +225,30 @@ def estimate_segment_height(segment, commentaries, font_size, chars_per_line=60,
     comm_lines = sum(max(1, len(comm[0] if isinstance(comm, tuple) else comm) // chars_per_line + 1) for comm in commentaries)
     return seg_lines + comm_lines
 
-def add_talmud_page(story, header, segments, commentaries, commentary_styles, font_size):
-    # Header
-    header_style = ParagraphStyle(
-        name='Header',
-        fontName='Hebrew',
-        fontSize=font_size,
-        alignment=TA_LEFT,
-        spaceAfter=10,
-    )
-    text_style = ParagraphStyle(
-        name='Text',
-        fontName='Hebrew',
-        fontSize=font_size,
-        alignment=TA_RIGHT,
-        spaceAfter=6,
-    )
-    
-    story.append(Paragraph(header, header_style))  # Header is LTR, no hebrew_rtl processing
+def add_talmud_page(pages, header, segments, commentaries, commentary_styles, font_size):
+    """Add a talmud page with segments and commentaries."""
+    segment_data = []
     for seg, comms in zip(segments, commentaries):
-        story.append(Paragraph(hebrew_rtl(seg), text_style))
-        for comm_data in comms:
-            # comm_data is a tuple: (text, commentary_name)
-            comm_text, comm_name = comm_data
-            # Get style for this commentary
-            style_info = commentary_styles.get(comm_name, {})
-            comm_font_size = style_info.get('font_size', font_size - 2)
-            comm_color = style_info.get('color', '#000000')
-            
-            # Create paragraph style for this commentary
-            comm_style = ParagraphStyle(
-                name=f'Commentary_{comm_name}',
-                fontName='Hebrew',
-                fontSize=comm_font_size,
-                alignment=TA_RIGHT,
-                leftIndent=20,
-                rightIndent=0,
-                spaceAfter=4,
-                textColor=comm_color,
-            )
-            story.append(Paragraph(hebrew_rtl(comm_text), comm_style))
-    story.append(PageBreak())
+        comm_list = []
+        for comm_text, comm_name in comms:
+            comm_list.append({'text': comm_text, 'name': comm_name})
+        segment_data.append({'text': seg, 'commentaries': comm_list})
+    
+    pages.append({
+        'type': 'content',
+        'header': header,
+        'segments': segment_data
+    })
 
 def main(
     ref_range,
     commentary_specs=DEFAULT_COMMENTARIES,
     font_size=DEFAULT_FONT_SIZE,
-    page_size=DEFAULT_PAGE_SIZE,
     add_cover=False,
     output_format="pdf",
     output_file=DEFAULT_OUTPUT,
-    font_path=DEFAULT_FONT
+    font_path=DEFAULT_FONT,
+    page_format=DEFAULT_PAGE_FORMAT
 ):
     # Setup logging
     logging.basicConfig(
@@ -224,8 +261,7 @@ def main(
     start_time = time.time()
     logger.info("Starting Talmud booklet generation")
     
-    register_hebrew_font(font_path)
-    story = []
+    pages = []
 
     # Parse commentary specifications
     commentary_styles = {}
@@ -247,7 +283,7 @@ def main(
     logger.info(f"Processing {len(refs)} Talmud pages from {start_ref} to {end_ref}")
 
     if add_cover:
-        add_cover_page(story, f"מסכת {start_ref}", font_size)
+        add_cover_page(pages, f"מסכת {start_ref}")
 
     for ref in refs:
         logger.info(f"Fetching {ref}")
@@ -305,24 +341,35 @@ def main(
             # Header: text name, page, segment range
             seg_range = f"{start_idx+1}-{start_idx+len(page_segments)}" if len(page_segments) > 1 else f"{start_idx+1}"
             header = f"{data['title']} {ref.split('_')[1]} (Segments {seg_range})"
-            add_talmud_page(story, header, page_segments, page_commentaries, commentary_styles, font_size)
-            # Ensure new Talmud text starts on even page
-            if idx < len(segments) and len(story) % 2 != 0:
-                add_blank_page(story)
+            add_talmud_page(pages, header, page_segments, page_commentaries, commentary_styles, font_size)
 
-    # Ensure text starts on even page
-    if len(story) % 2 != 0:
-        add_blank_page(story)
-
-    # Output
-    logger.info(f"Writing output to {output_file}")
-    if output_format == "pdf":
-        doc = SimpleDocTemplate(output_file, pagesize=page_size, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
-        doc.build(story)
-        logger.info(f"PDF generated successfully: {output_file}")
-    else:
-        logger.error("RTF output not implemented.")
+    # Generate HTML
+    logger.info("Generating HTML")
+    html_content = generate_html(pages, start_ref, font_path, font_size, commentary_styles)
     
+    # Write HTML to temporary file
+    html_file = Path("temp_talmud.html")
+    html_file.write_text(html_content, encoding="utf-8")
+    logger.info(f"HTML written to {html_file}")
+
+    # Generate PDF using Playwright
+    logger.info(f"Generating PDF with Playwright: {output_file}")
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.goto(html_file.resolve().as_uri())
+        page.pdf(
+            path=output_file,
+            format=page_format,
+            print_background=True,
+            margin={"top": "5mm", "bottom": "5mm", "left": "5mm", "right": "5mm"}
+        )
+        browser.close()
+    
+    # Clean up temporary HTML file
+    html_file.unlink()
+    
+    logger.info(f"PDF generated successfully: {output_file}")
     elapsed_time = time.time() - start_time
     logger.info(f"Total execution time: {elapsed_time:.2f} seconds")
 
@@ -354,7 +401,8 @@ Commentary Format:
                         help="Commentary specifications (see format below)")
     parser.add_argument("--font_size", type=int, default=DEFAULT_FONT_SIZE,
                         help="Base font size for main text")
-    parser.add_argument("--page_size", default="A4", help="Page size (A4 or custom)")
+    parser.add_argument("--page_format", default=DEFAULT_PAGE_FORMAT, 
+                        help="Page format (A4, A5, A6, Letter, etc.)")
     parser.add_argument("--cover", action="store_true", help="Add cover page")
     parser.add_argument("--format", default="pdf", help="Output format (pdf only)")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output file path")
@@ -364,9 +412,9 @@ Commentary Format:
         args.ref_range,
         commentary_specs=args.commentaries,
         font_size=args.font_size,
-        page_size=A4 if args.page_size == "A4" else args.page_size,
         add_cover=args.cover,
         output_format=args.format,
         output_file=args.output,
-        font_path=args.font
+        font_path=args.font,
+        page_format=args.page_format
     )
