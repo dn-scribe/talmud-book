@@ -207,11 +207,13 @@ def generate_html(all_content, title, font_path, font_size, commentary_styles):
   
   .segment {{
     margin-bottom: 3px;
-    text-align: right;
+    text-align: justify;
+    text-align-last: right;
   }}
   
   .commentary {{
-    text-align: right;
+    text-align: justify;
+    text-align-last: right;
   }}
   
 {commentary_css}
