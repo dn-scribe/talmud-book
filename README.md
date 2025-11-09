@@ -47,7 +47,9 @@ python talmud_booklet.py Berakhot_2a \
 - `--commentaries` - List of commentaries with optional size and color
 - `--font_size` - Base font size for main text (default: 10pt)
 - `--page_format` - Page format: A6, A5, A4, Letter (default: A6)
+- `--text_format` - Layout format: `optimize` (batched, default) or `text-commentaries` (traditional inline)
 - `--cover` - Add a cover page
+- `--no-cache` - Ignore content cache and regenerate from API (deletes existing cache)
 - `--output` - Output PDF filename (default: output.pdf)
 - `--font` - Path to Hebrew TTF font file (default: NotoSansHebrew-Regular.ttf)
 
@@ -124,6 +126,9 @@ This should generate `output.pdf` with the first page of Tractate Berakhot.
    - Applies RTL (right-to-left) text direction via CSS
    - Generates separate CSS classes for each commentary with custom styling
    - Each page is a `<div class="page">` with automatic page breaks
+   - Two layout modes available:
+     - **Optimize** (default): Groups segments in batches, all Talmud text first, then all commentaries
+     - **Text-commentaries**: Traditional inline layout with each segment followed by its commentaries
 
 3. **PDF Rendering with Playwright**:
    - Writes HTML to temporary file (`temp_talmud.html`)
@@ -151,14 +156,45 @@ Playwright provides superior Hebrew text rendering compared to ReportLab:
 
 ### Caching
 
-Text is automatically cached in the `data/` directory:
-- Reduces API calls to Sefaria
-- Speeds up regeneration of PDFs
-- Files named by reference (e.g., `Berakhot_2a.json`)
+The generator uses two levels of caching to improve performance:
 
-To clear cache and fetch fresh data:
+#### 1. API Response Cache (`data/` directory)
+Individual API responses from Sefaria are cached:
+- Reduces API calls to Sefaria
+- Speeds up regeneration when changing PDF options
+- Files named by reference (e.g., `Berakhot_2a.json`, `Rashi_on_Berakhot_2a_1.json`)
+
+To clear API cache and fetch fresh data from Sefaria:
 ```bash
 rm -rf data/
+```
+
+#### 2. Content Cache (`content_cache/` directory)
+The compiled content structure (after fetching all API data) is cached:
+- Saves time by avoiding repeated API calls and data processing
+- Cache filename is based on command-line options (ref_range, commentaries, cover)
+- Example: `Berakhot_2a_to_Berakhot_2b__Rashi_Tosafot__cover.json`
+
+**Using the content cache:**
+```bash
+# First run: fetches from API and caches
+python talmud_booklet.py Berakhot_2a-Berakhot_2b --cover
+
+# Second run: uses cached content (much faster)
+python talmud_booklet.py Berakhot_2a-Berakhot_2b --cover
+
+# Force regeneration: deletes cache and rebuilds
+python talmud_booklet.py Berakhot_2a-Berakhot_2b --cover --no-cache
+```
+
+**Cache behavior:**
+- By default, the content cache is used if it exists
+- Use `--no-cache` to ignore and delete the cache, forcing fresh data fetching
+- Different options create different cache files (e.g., with/without cover, different commentaries)
+
+To clear all content caches:
+```bash
+rm -rf content_cache/
 ```
 
 ### Page Format Sizes

@@ -13,8 +13,76 @@ DEFAULT_FONT_SIZE = 10  # Smaller for A6
 DEFAULT_OUTPUT = "output.pdf"
 DEFAULT_COMMENTARIES = ["Rashi_on_Berakhot:8:#0000FF", "Tosafot_on_Berakhot:8:#008000"]
 CACHE_DIR = "data"
+CONTENT_CACHE_DIR = "content_cache"  # Directory for all_content cache files
 DEFAULT_PAGE_FORMAT = "A6"  # A6 is half the size of A5, which is half of A4
 # ---------------------
+
+def generate_content_cache_filename(ref_range, commentary_specs, add_cover):
+    """
+    Generate a cache filename based on command-line options.
+    Format: {ref_range}__{commentaries}__{cover}.json
+    """
+    # Sanitize ref_range (replace / and - with _)
+    safe_ref = ref_range.replace("/", "_").replace("-", "_to_")
+    
+    # Create a short representation of commentaries (just the names)
+    comm_names = []
+    for spec in commentary_specs:
+        name = spec.split(':')[0]
+        # Simplify name (remove _on_Berakhot suffix if present)
+        short_name = name.replace('_on_Berakhot', '')
+        comm_names.append(short_name)
+    comms_str = "_".join(comm_names)
+    
+    # Add cover flag
+    cover_str = "cover" if add_cover else "nocover"
+    
+    filename = f"{safe_ref}__{comms_str}__{cover_str}.json"
+    return filename
+
+def save_content_cache(all_content, cache_filename):
+    """Save all_content to cache file."""
+    os.makedirs(CONTENT_CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(CONTENT_CACHE_DIR, cache_filename)
+    
+    try:
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(all_content, f, ensure_ascii=False, indent=2)
+        logging.info(f"Saved content cache to {cache_path}")
+        return True
+    except Exception as e:
+        logging.warning(f"Error saving content cache: {e}")
+        return False
+
+def load_content_cache(cache_filename):
+    """Load all_content from cache file. Returns None if not found or error."""
+    cache_path = os.path.join(CONTENT_CACHE_DIR, cache_filename)
+    
+    if not os.path.exists(cache_path):
+        return None
+    
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        logging.info(f"Loaded content cache from {cache_path}")
+        return data
+    except Exception as e:
+        logging.warning(f"Error loading content cache: {e}")
+        return None
+
+def delete_content_cache(cache_filename):
+    """Delete content cache file if it exists."""
+    cache_path = os.path.join(CONTENT_CACHE_DIR, cache_filename)
+    
+    if os.path.exists(cache_path):
+        try:
+            os.remove(cache_path)
+            logging.info(f"Deleted content cache: {cache_path}")
+            return True
+        except Exception as e:
+            logging.warning(f"Error deleting content cache: {e}")
+            return False
+    return False
 
 def parse_commentary_spec(spec):
     """
@@ -522,7 +590,8 @@ def main(
     output_file=DEFAULT_OUTPUT,
     font_path=DEFAULT_FONT,
     page_format=DEFAULT_PAGE_FORMAT,
-    text_format="optimize"
+    text_format="optimize",
+    no_cache=False
 ):
     # Setup logging
     logging.basicConfig(
@@ -535,13 +604,94 @@ def main(
     start_time = time.time()
     logger.info("Starting Talmud booklet generation")
     
-    # Initialize content structure
-    all_content = {
-        'cover': None,
-        'pages': []
-    }
+    # Generate cache filename based on options
+    cache_filename = generate_content_cache_filename(ref_range, commentary_specs, add_cover)
+    
+    # Handle --no-cache flag: delete cache if it exists
+    if no_cache:
+        delete_content_cache(cache_filename)
+    
+    # Try to load from cache first (unless no_cache is set)
+    all_content = None
+    if not no_cache:
+        all_content = load_content_cache(cache_filename)
+    
+    # If cache miss or no_cache, generate content
+    if all_content is None:
+        logger.info("Building content from API calls")
+        
+        # Initialize content structure
+        all_content = {
+            'cover': None,
+            'pages': []
+        }
 
-    # Parse commentary specifications
+        # Parse commentary specifications
+        commentary_styles = {}
+        commentary_prefixes = []
+        for spec in commentary_specs:
+            name, comm_font_size, color = parse_commentary_spec(spec)
+            commentary_prefixes.append(name)
+            commentary_styles[name] = {
+                'font_size': comm_font_size if comm_font_size else font_size - 2,
+                'color': color if color else '#000000'
+            }
+        
+        logger.info(f"Commentaries: {', '.join(commentary_prefixes)}")
+
+        # Parse range
+        start_ref, end_ref = parse_range(ref_range)
+        # Generate all refs in range
+        refs = generate_talmud_refs(start_ref, end_ref)
+        logger.info(f"Processing {len(refs)} Talmud pages from {start_ref} to {end_ref}")
+
+        if add_cover:
+            add_cover_page(all_content, f"מסכת {start_ref}")
+
+        for ref in refs:
+            logger.info(f"Fetching {ref}")
+            data, err = fetch_sefaria_text(ref)
+            if err:
+                logger.warning(f"Error fetching {ref}: {err}")
+                # Insert placeholder for missing page
+                segments = [f"[Missing text for {ref}]"]
+                all_commentaries = [[]]
+            else:
+                segments = data["versions"][0]["text"]
+                if isinstance(segments, str):
+                    segments = [segments]
+                # Fetch commentaries for each segment
+                all_commentaries = []
+                for i, seg in enumerate(segments, 1):
+                    comms = []
+                    for prefix in commentary_prefixes:
+                        comm_ref = f"{prefix}.{ref.split('_')[1]}.{i}"
+                        comm_data, comm_err = fetch_sefaria_text(comm_ref)
+                        if comm_data and "versions" in comm_data:
+                            comm_texts = comm_data["versions"][0]["text"]
+                            if isinstance(comm_texts, str):
+                                comm_texts = [comm_texts]
+                            # Store as tuples: (text, commentary_name)
+                            for text in comm_texts:
+                                comms.append((text, prefix))
+                        elif comm_err:
+                            logger.debug(f"Missing commentary {prefix} on {ref}.{i}: {comm_err}")
+                            # Don't add placeholder - just skip missing commentaries
+                    all_commentaries.append(comms)
+            
+            # Create header for this Talmud page (all segments from this daf)
+            header = f"{data.get('title', ref)} {ref.split('_')[1]}"
+            
+            # Build the page with all its segments
+            talmud_page = build_talmud_page(header, segments, all_commentaries)
+            all_content['pages'].append(talmud_page)
+        
+        # Save to cache for future runs
+        save_content_cache(all_content, cache_filename)
+    else:
+        logger.info("Using cached content")
+    
+    # Parse commentary specifications for styles (needed even when using cache)
     commentary_styles = {}
     commentary_prefixes = []
     for spec in commentary_specs:
@@ -551,59 +701,10 @@ def main(
             'font_size': comm_font_size if comm_font_size else font_size - 2,
             'color': color if color else '#000000'
         }
-    
-    logger.info(f"Commentaries: {', '.join(commentary_prefixes)}")
-
-    # Parse range
-    start_ref, end_ref = parse_range(ref_range)
-    # Generate all refs in range
-    refs = generate_talmud_refs(start_ref, end_ref)
-    logger.info(f"Processing {len(refs)} Talmud pages from {start_ref} to {end_ref}")
-
-    if add_cover:
-        add_cover_page(all_content, f"מסכת {start_ref}")
-
-    for ref in refs:
-        logger.info(f"Fetching {ref}")
-        data, err = fetch_sefaria_text(ref)
-        if err:
-            logger.warning(f"Error fetching {ref}: {err}")
-            # Insert placeholder for missing page
-            segments = [f"[Missing text for {ref}]"]
-            all_commentaries = [[]]
-        else:
-            segments = data["versions"][0]["text"]
-            if isinstance(segments, str):
-                segments = [segments]
-            # Fetch commentaries for each segment
-            all_commentaries = []
-            for i, seg in enumerate(segments, 1):
-                comms = []
-                for prefix in commentary_prefixes:
-                    comm_ref = f"{prefix}.{ref.split('_')[1]}.{i}"
-                    comm_data, comm_err = fetch_sefaria_text(comm_ref)
-                    if comm_data and "versions" in comm_data:
-                        comm_texts = comm_data["versions"][0]["text"]
-                        if isinstance(comm_texts, str):
-                            comm_texts = [comm_texts]
-                        # Store as tuples: (text, commentary_name)
-                        for text in comm_texts:
-                            comms.append((text, prefix))
-                    elif comm_err:
-                        logger.debug(f"Missing commentary {prefix} on {ref}.{i}: {comm_err}")
-                        # Don't add placeholder - just skip missing commentaries
-                all_commentaries.append(comms)
-        
-        # Create header for this Talmud page (all segments from this daf)
-        header = f"{data.get('title', ref)} {ref.split('_')[1]}"
-        
-        # Build the page with all its segments
-        talmud_page = build_talmud_page(header, segments, all_commentaries)
-        all_content['pages'].append(talmud_page)
 
     # Generate HTML
     logger.info("Generating HTML")
-    html_content = generate_html(all_content, start_ref, font_path, font_size, commentary_styles, commentary_prefixes, text_format)
+    html_content = generate_html(all_content, ref_range, font_path, font_size, commentary_styles, commentary_prefixes, text_format)
     
     # Write HTML to temporary file
     html_file = Path("temp_talmud.html")
@@ -664,6 +765,8 @@ Commentary Format:
     parser.add_argument("--text_format", default="optimize", choices=["optimize", "text-commentaries"],
                         help="Layout format: 'optimize' (batched, default) or 'text-commentaries' (traditional inline)")
     parser.add_argument("--cover", action="store_true", help="Add cover page")
+    parser.add_argument("--no-cache", action="store_true", 
+                        help="Ignore content cache and regenerate from API (deletes existing cache)")
     parser.add_argument("--format", default="pdf", help="Output format (pdf only)")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output file path")
     parser.add_argument("--font", default=DEFAULT_FONT, help="Path to Hebrew TTF font file")
@@ -677,5 +780,6 @@ Commentary Format:
         output_file=args.output,
         font_path=args.font,
         page_format=args.page_format,
-        text_format=args.text_format
+        text_format=args.text_format,
+        no_cache=args.no_cache
     )
