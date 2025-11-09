@@ -350,6 +350,8 @@ def generate_html_optimized(all_content, title, font_path, font_size, commentary
   
   .commentary-item {{
     margin-bottom: 2px;
+    text-align: justify;
+    text-align-last: right;
   }}
   
   .commentary {{
