@@ -4,3 +4,5 @@ data/
 content_cache/
 output.pdf
 .env
+*.pyc
+__pycache__/

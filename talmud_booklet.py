@@ -1,6 +1,7 @@
 import requests
 from playwright.sync_api import sync_playwright
 from pathlib import Path
+from urllib.parse import unquote
 import sys
 import os
 import json
@@ -17,10 +18,10 @@ CONTENT_CACHE_DIR = "content_cache"  # Directory for all_content cache files
 DEFAULT_PAGE_FORMAT = "A6"  # A6 is half the size of A5, which is half of A4
 # ---------------------
 
-def generate_content_cache_filename(ref_range, commentary_specs, add_cover):
+def generate_content_cache_filename(ref_range, commentary_specs, add_cover, with_vowels=True):
     """
     Generate a cache filename based on command-line options.
-    Format: {ref_range}__{commentaries}__{cover}.json
+    Format: {ref_range}__{commentaries}__{cover}__{vowels}.json
     """
     # Sanitize ref_range (replace / and - with _)
     safe_ref = ref_range.replace("/", "_").replace("-", "_to_")
@@ -37,7 +38,10 @@ def generate_content_cache_filename(ref_range, commentary_specs, add_cover):
     # Add cover flag
     cover_str = "cover" if add_cover else "nocover"
     
-    filename = f"{safe_ref}__{comms_str}__{cover_str}.json"
+    # Add vowels flag
+    vowels_str = "vowels" if with_vowels else "novowels"
+    
+    filename = f"{safe_ref}__{comms_str}__{cover_str}__{vowels_str}.json"
     return filename
 
 def save_content_cache(all_content, cache_filename):
@@ -111,12 +115,72 @@ def parse_commentary_spec(spec):
     
     return name, font_size, color
 
-def fetch_sefaria_text(ref):
+def sanitize_filename(ref):
+    """Sanitize a Sefaria ref for filesystem cache storage."""
+    safe = ref.replace("/", "_").replace(".", "_")
+    safe = safe.replace(",", "_").replace("%", "_").replace(" ", "_")
+    safe = safe.replace(":", "_").replace("\\", "_")
+    return safe + ".json"
+
+
+def is_talmud_page_ref(ref):
+    try:
+        parse_talmud_page(ref)
+        return True
+    except ValueError:
+        return False
+
+
+def fetch_sefaria_book_sections(book_ref):
+    """Fetch section refs for a complex Sefaria book by scraping its HTML table of contents."""
+    candidates = [
+        f"https://www.sefaria.org/{book_ref}",
+        f"https://www.sefaria.org.il/{book_ref}",
+    ]
+    for url in candidates:
+        try:
+            resp = requests.get(url, timeout=20)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+        text = resp.text
+        if 'textTableOfContents' not in text:
+            continue
+        refs = []
+        for part in text.split('textTableOfContents')[1].split('"schema-node-toc linked"'):
+            if 'href="/' not in part:
+                continue
+            href = part.split('href="/')[1].split('"')[0]
+            if href:
+                refs.append(unquote(href))
+        if refs:
+            return refs
+    return None
+
+
+def build_refs_from_range(ref_range):
+    # For Talmud daf ranges like Berakhot_3a-Berakhot_5b
+    if "-" in ref_range:
+        parts = ref_range.split("-")
+        if len(parts) == 2 and is_talmud_page_ref(parts[0]) and is_talmud_page_ref(parts[1]):
+            return generate_talmud_refs(parts[0], parts[1])
+        # Fall through for non-Talmud book refs that are not page ranges
+    if is_talmud_page_ref(ref_range):
+        return [ref_range]
+    # Treat this as a book-level ref and expand to section refs
+    sections = fetch_sefaria_book_sections(ref_range)
+    if sections:
+        return sections
+    raise ValueError(f"Unable to resolve reference range: {ref_range}")
+
+
+def fetch_sefaria_text(ref, with_vowels=True):
     # Create cache directory if it doesn't exist
     os.makedirs(CACHE_DIR, exist_ok=True)
     
-    # Create a safe filename from the ref (replace / and . with _)
-    safe_filename = ref.replace("/", "_").replace(".", "_") + ".json"
+    # Create a safe filename from the ref
+    safe_filename = sanitize_filename(ref)
     cache_path = os.path.join(CACHE_DIR, safe_filename)
     
     # Check if cached file exists
@@ -130,8 +194,10 @@ def fetch_sefaria_text(ref):
             logging.warning(f"Error reading cache for {ref}: {e}, fetching from API")
     
     # Fetch from API
-    url = f"https://www.sefaria.org/api/v3/texts/{ref}?return_format=text_only"
-    resp = requests.get(url)
+    url = f"https://www.sefaria.org/api/v3/texts/{requests.utils.requote_uri(ref)}?return_format=text_only"
+    if with_vowels:
+        url += "&with_vowels=1"
+    resp = requests.get(url, timeout=20)
     if resp.status_code != 200:
         return None, f"HTTP {resp.status_code}"
     data = resp.json()
@@ -593,7 +659,8 @@ def main(
     font_path=DEFAULT_FONT,
     page_format=DEFAULT_PAGE_FORMAT,
     text_format="optimize",
-    no_cache=False
+    no_cache=False,
+    with_vowels=True
 ):
     # Setup logging
     logging.basicConfig(
@@ -607,7 +674,7 @@ def main(
     logger.info(f"Starting Talmud booklet generation (format: {output_format})")
     
     # Generate cache filename based on options
-    cache_filename = generate_content_cache_filename(ref_range, commentary_specs, add_cover)
+    cache_filename = generate_content_cache_filename(ref_range, commentary_specs, add_cover, with_vowels)
     
     # Handle --no-cache flag: delete cache if it exists
     if no_cache:
@@ -641,18 +708,16 @@ def main(
         
         logger.info(f"Commentaries: {', '.join(commentary_prefixes)}")
 
-        # Parse range
-        start_ref, end_ref = parse_range(ref_range)
-        # Generate all refs in range
-        refs = generate_talmud_refs(start_ref, end_ref)
-        logger.info(f"Processing {len(refs)} Talmud pages from {start_ref} to {end_ref}")
+        # Build the list of refs to fetch (Talmud daf range or complex book sections)
+        refs = build_refs_from_range(ref_range)
+        logger.info(f"Processing {len(refs)} refs from {ref_range}")
 
         if add_cover:
-            add_cover_page(all_content, f"מסכת {start_ref}")
+            add_cover_page(all_content, ref_range)
 
         for ref in refs:
             logger.info(f"Fetching {ref}")
-            data, err = fetch_sefaria_text(ref)
+            data, err = fetch_sefaria_text(ref, with_vowels=with_vowels)
             if err:
                 logger.warning(f"Error fetching {ref}: {err}")
                 # Insert placeholder for missing page
@@ -681,8 +746,8 @@ def main(
                             # Don't add placeholder - just skip missing commentaries
                     all_commentaries.append(comms)
             
-            # Create header for this Talmud page (all segments from this daf)
-            header = f"{data.get('title', ref)} {ref.split('_')[1]}"
+            # Create header for this page or section
+            header = data.get('title', ref)
             
             # Build the page with all its segments
             talmud_page = build_talmud_page(header, segments, all_commentaries)
@@ -778,7 +843,7 @@ Commentary Format:
     --commentaries Rashi_on_Berakhot:10:#0000FF Tosafot_on_Berakhot:12:#008000
         """
     )
-    parser.add_argument("ref_range", help="Reference or range, e.g. Berakhot_3a-Berakhot_5b")
+    parser.add_argument("ref_range", help="Reference or range, e.g. Berakhot_3a-Berakhot_5b or Azharot_of_Solomon_ibn_Gabirol")
     parser.add_argument("--commentaries", nargs="+", default=DEFAULT_COMMENTARIES,
                         help="Commentary specifications (see format below)")
     parser.add_argument("--font_size", type=int, default=DEFAULT_FONT_SIZE,
@@ -790,11 +855,14 @@ Commentary Format:
     parser.add_argument("--cover", action="store_true", help="Add cover page")
     parser.add_argument("--no-cache", action="store_true", 
                         help="Ignore content cache and regenerate from API (deletes existing cache)")
+    parser.add_argument("--no-vowels", action="store_true",
+                        help="Disable vowelized Hebrew text fetches")
     parser.add_argument("--format", default="pdf", choices=["pdf", "html", "html-for-epub"],
                         help="Output format: pdf (default), html, or html-for-epub")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output file path")
     parser.add_argument("--font", default=DEFAULT_FONT, help="Path to Hebrew TTF font file")
     args = parser.parse_args()
+    with_vowels = not args.no_vowels
     main(
         args.ref_range,
         commentary_specs=args.commentaries,
@@ -805,5 +873,6 @@ Commentary Format:
         font_path=args.font,
         page_format=args.page_format,
         text_format=args.text_format,
-        no_cache=args.no_cache
+        no_cache=args.no_cache,
+        with_vowels=with_vowels
     )
